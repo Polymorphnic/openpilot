@@ -65,7 +65,7 @@ FINGERPRINTS = {
 }
 
 FW_VERSIONS = {
-  CAR.XV: {
+  CAR.IMPREZA: {
     (Ecu.engine, 0x000007E0, None): [
       b'\xf1\x00\xa2\x10\t',
     ],
