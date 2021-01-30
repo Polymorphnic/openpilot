@@ -1,7 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <signal.h>
 #include <unistd.h>
 #include <sched.h>
 #include <errno.h>
@@ -39,12 +38,12 @@
 
 Panda * panda = NULL;
 std::atomic<bool> safety_setter_thread_running(false);
-volatile sig_atomic_t do_exit = 0;
+std::atomic<bool> ignition(false);
 bool spoofing_started = false;
 bool fake_send = false;
 bool connected_once = false;
-bool ignition = false;
 
+ExitHandler do_exit;
 struct tm get_time(){
   time_t rawtime;
   time(&rawtime);
@@ -67,7 +66,7 @@ void safety_setter_thread() {
   panda->set_safety_model(cereal::CarParams::SafetyModel::ELM327);
 
   // switch to SILENT when CarVin param is read
-  while (1) {
+  while (true) {
     if (do_exit || !panda->connected){
       safety_setter_thread_running = false;
       return;
@@ -81,7 +80,7 @@ void safety_setter_thread() {
       LOGW("got CarVin %s", str_vin.c_str());
       break;
     }
-    usleep(100*1000);
+    util::sleep_for(100);
   }
 
   // VIN query done, stop listening to OBDII
@@ -89,7 +88,7 @@ void safety_setter_thread() {
 
   std::vector<char> params;
   LOGW("waiting for params to set safety model");
-  while (1) {
+  while (true) {
     if (do_exit || !panda->connected){
       safety_setter_thread_running = false;
       return;
@@ -97,7 +96,7 @@ void safety_setter_thread() {
 
     params = Params().read_db_bytes("CarParams");
     if (params.size() > 0) break;
-    usleep(100*1000);
+    util::sleep_for(100);
   }
   LOGW("got %d bytes CarParams", params.size());
 
@@ -121,9 +120,10 @@ void safety_setter_thread() {
 
 
 bool usb_connect() {
+  std::unique_ptr<Panda> tmp_panda;
   try {
     assert(panda == NULL);
-    panda = new Panda();
+    tmp_panda = std::make_unique<Panda>();
   } catch (std::exception &e) {
     return false;
   }
@@ -131,15 +131,15 @@ bool usb_connect() {
   Params params = Params();
 
   if (getenv("BOARDD_LOOPBACK")) {
-    panda->set_loopback(true);
+    tmp_panda->set_loopback(true);
   }
 
-  const char *fw_sig_buf = panda->get_firmware_version();
-  if (fw_sig_buf){
-    params.write_db_value("PandaFirmware", fw_sig_buf, 128);
+  if (auto fw_sig = tmp_panda->get_firmware_version(); fw_sig) {
+    params.write_db_value("PandaFirmware", (const char *)fw_sig->data(), fw_sig->size());
 
     // Convert to hex for offroad
     char fw_sig_hex_buf[16] = {0};
+    const uint8_t *fw_sig_buf = fw_sig->data();
     for (size_t i = 0; i < 8; i++){
       fw_sig_hex_buf[2*i] = NIBBLE_TO_HEX((uint8_t)fw_sig_buf[i] >> 4);
       fw_sig_hex_buf[2*i+1] = NIBBLE_TO_HEX((uint8_t)fw_sig_buf[i] & 0xF);
@@ -147,31 +147,24 @@ bool usb_connect() {
 
     params.write_db_value("PandaFirmwareHex", fw_sig_hex_buf, 16);
     LOGW("fw signature: %.*s", 16, fw_sig_hex_buf);
-
-    delete[] fw_sig_buf;
   } else { return false; }
 
   // get panda serial
-  const char *serial_buf = panda->get_serial();
-  if (serial_buf) {
-    size_t serial_sz = strnlen(serial_buf, 16);
-
-    params.write_db_value("PandaDongleId", serial_buf, serial_sz);
-    LOGW("panda serial: %.*s", serial_sz, serial_buf);
-
-    delete[] serial_buf;
+  if (auto serial = tmp_panda->get_serial(); serial) {
+    params.write_db_value("PandaDongleId", serial->c_str(), serial->length());
+    LOGW("panda serial: %s", serial->c_str());
   } else { return false; }
 
   // power on charging, only the first time. Panda can also change mode and it causes a brief disconneciton
 #ifndef __x86_64__
   if (!connected_once) {
-    panda->set_usb_power_mode(cereal::HealthData::UsbPowerMode::CDP);
+    tmp_panda->set_usb_power_mode(cereal::HealthData::UsbPowerMode::CDP);
   }
 #endif
 
-  if (panda->has_rtc){
+  if (tmp_panda->has_rtc){
     struct tm sys_time = get_time();
-    struct tm rtc_time = panda->get_rtc();
+    struct tm rtc_time = tmp_panda->get_rtc();
 
     if (!time_valid(sys_time) && time_valid(rtc_time)) {
       LOGE("System time wrong, setting from RTC");
@@ -183,22 +176,22 @@ bool usb_connect() {
   }
 
   connected_once = true;
+  panda = tmp_panda.release();
   return true;
 }
 
 // must be called before threads or with mutex
 void usb_retry_connect() {
   LOGW("attempting to connect");
-  while (!usb_connect()) { usleep(100*1000); }
+  while (!usb_connect()) { util::sleep_for(100); }
   LOGW("connected to board");
 }
 
 void can_recv(PubMaster &pm) {
-  // create message
-  MessageBuilder msg;
-  auto event = msg.initEvent();
-  panda->can_receive(event);
-  pm.send("can", msg);
+  kj::Array<capnp::word> can_data;
+  panda->can_receive(can_data);
+  auto bytes = can_data.asBytes();
+  pm.send("can", bytes.begin(), bytes.size());
 }
 
 void can_send_thread() {
@@ -255,9 +248,8 @@ void can_recv_thread() {
 
     uint64_t cur_time = nanos_since_boot();
     int64_t remaining = next_frame_time - cur_time;
-    if (remaining > 0){
-      useconds_t sleep = remaining / 1000;
-      usleep(sleep);
+    if (remaining > 0) {
+      std::this_thread::sleep_for(std::chrono::nanoseconds(remaining));
     } else {
       if (ignition){
         LOGW("missed cycles (%d) %lld", (int)-1*remaining/dt, remaining);
@@ -278,20 +270,17 @@ void can_health_thread() {
   Params params = Params();
 
   // Broadcast empty health message when panda is not yet connected
-  while (!panda){
+  while (!do_exit && !panda) {
     MessageBuilder msg;
     auto healthData  = msg.initEvent().initHealth();
 
     healthData.setHwType(cereal::HealthData::HwType::UNKNOWN);
     pm.send("health", msg);
-    usleep(500*1000);
+    util::sleep_for(500);
   }
 
   // run at 2hz
   while (!do_exit && panda->connected) {
-    MessageBuilder msg;
-    auto healthData = msg.initEvent().initHealth();
-
     health_t health = panda->get_health();
 
     if (spoofing_started) {
@@ -351,9 +340,18 @@ void can_health_thread() {
     uint16_t fan_speed_rpm = panda->get_fan_speed();
 
     // set fields
+    MessageBuilder msg;
+    auto healthData = msg.initEvent().initHealth();
     healthData.setUptime(health.uptime);
+
+#ifdef QCOM2
+    healthData.setVoltage(std::stoi(util::read_file("/sys/class/hwmon/hwmon1/in1_input")));
+    healthData.setCurrent(std::stoi(util::read_file("/sys/class/hwmon/hwmon1/curr1_input")));
+#else
     healthData.setVoltage(health.voltage);
     healthData.setCurrent(health.current);
+#endif
+
     healthData.setIgnitionLine(health.ignition_line);
     healthData.setIgnitionCan(health.ignition_can);
     healthData.setControlsAllowed(health.controls_allowed);
@@ -384,7 +382,7 @@ void can_health_thread() {
     }
     pm.send("health", msg);
     panda->send_heartbeat();
-    usleep(500*1000);
+    util::sleep_for(500);
   }
 }
 
@@ -459,15 +457,13 @@ void hardware_control_thread() {
   }
 }
 
-static void pigeon_publish_raw(PubMaster &pm, std::string dat) {
+static void pigeon_publish_raw(PubMaster &pm, const std::string &dat) {
   // create message
   MessageBuilder msg;
-  auto ublox_raw = msg.initEvent().initUbloxRaw(dat.length());
-  memcpy(ublox_raw.begin(), dat.data(), dat.length());
-
+  capnp::Data::Builder ublox_row((uint8_t*)dat.data(), dat.length());
+  msg.initEvent().setUbloxRaw(ublox_row);
   pm.send("ubloxRaw", msg);
 }
-
 
 void pigeon_thread() {
   if (!panda->is_pigeon){ return; };
@@ -504,7 +500,7 @@ void pigeon_thread() {
     ignition_last = ignition;
 
     // 10ms - 100 Hz
-    usleep(10*1000);
+    util::sleep_for(10);
   }
 
   delete pigeon;

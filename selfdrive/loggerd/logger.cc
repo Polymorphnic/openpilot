@@ -6,28 +6,36 @@
 #include <assert.h>
 #include <time.h>
 #include <errno.h>
-
 #include <unistd.h>
 #include <sys/stat.h>
 
 #include <pthread.h>
 #include <bzlib.h>
-#include "messaging.hpp"
+#include <iostream>
+#include <fstream>
+#include <streambuf>
+#ifdef QCOM
+#include <cutils/properties.h>
+#endif
 
 #include "common/swaglog.h"
-
+#include "common/params.h"
+#include "common/util.h"
+#include "common/version.h"
+#include "messaging.hpp"
 #include "logger.h"
 
-static void log_sentinel(LoggerState *s, cereal::Sentinel::SentinelType type) {
-  MessageBuilder msg;
-  auto sen = msg.initEvent().initSentinel();
-  sen.setType(type);
-  auto bytes = msg.toBytes();
 
-  logger_log(s, bytes.begin(), bytes.size(), true);
+// ***** logging helpers *****
+
+void append_property(const char* key, const char* value, void *cookie) {
+  std::vector<std::pair<std::string, std::string> > *properties =
+    (std::vector<std::pair<std::string, std::string> > *)cookie;
+
+  properties->push_back(std::make_pair(std::string(key), std::string(value)));
 }
 
-static int mkpath(char* file_path) {
+int logger_mkpath(char* file_path) {
   assert(file_path && *file_path);
   char* p;
   for (p=strchr(file_path+1, '/'); p; p=strchr(p+1, '/')) {
@@ -43,15 +51,111 @@ static int mkpath(char* file_path) {
   return 0;
 }
 
-void logger_init(LoggerState *s, const char* log_name, const uint8_t* init_data, size_t init_data_len, bool has_qlog) {
-  memset(s, 0, sizeof(*s));
-  if (init_data) {
-    s->init_data = (uint8_t*)malloc(init_data_len);
-    assert(s->init_data);
-    memcpy(s->init_data, init_data, init_data_len);
-    s->init_data_len = init_data_len;
+// ***** log metadata *****
+kj::Array<capnp::word> logger_build_boot() {
+  MessageBuilder msg;
+  auto boot = msg.initEvent().initBoot();
+
+  boot.setWallTimeNanos(nanos_since_epoch());
+
+  std::string lastKmsg = util::read_file("/sys/fs/pstore/console-ramoops");
+  boot.setLastKmsg(capnp::Data::Reader((const kj::byte*)lastKmsg.data(), lastKmsg.size()));
+
+  std::string lastPmsg = util::read_file("/sys/fs/pstore/pmsg-ramoops-0");
+  boot.setLastPmsg(capnp::Data::Reader((const kj::byte*)lastPmsg.data(), lastPmsg.size()));
+
+  std::string launchLog = util::read_file("/tmp/launch_log");
+  boot.setLaunchLog(capnp::Text::Reader(launchLog.data(), launchLog.size()));
+  return capnp::messageToFlatArray(msg);
+}
+
+kj::Array<capnp::word> logger_build_init_data() {
+  MessageBuilder msg;
+  auto init = msg.initEvent().initInitData();
+
+  if (util::file_exists("/EON")) {
+    init.setDeviceType(cereal::InitData::DeviceType::NEO);
+  } else if (util::file_exists("/TICI")) {
+    init.setDeviceType(cereal::InitData::DeviceType::TICI);
+  } else {
+    init.setDeviceType(cereal::InitData::DeviceType::PC);
   }
 
+  init.setVersion(capnp::Text::Reader(COMMA_VERSION));
+
+  std::ifstream cmdline_stream("/proc/cmdline");
+  std::vector<std::string> kernel_args;
+  std::string buf;
+  while (cmdline_stream >> buf) {
+    kernel_args.push_back(buf);
+  }
+
+  auto lkernel_args = init.initKernelArgs(kernel_args.size());
+  for (int i=0; i<kernel_args.size(); i++) {
+    lkernel_args.set(i, kernel_args[i]);
+  }
+
+  init.setKernelVersion(util::read_file("/proc/version"));
+
+#ifdef QCOM
+  {
+    std::vector<std::pair<std::string, std::string> > properties;
+    property_list(append_property, (void*)&properties);
+
+    auto lentries = init.initAndroidProperties().initEntries(properties.size());
+    for (int i=0; i<properties.size(); i++) {
+      auto lentry = lentries[i];
+      lentry.setKey(properties[i].first);
+      lentry.setValue(properties[i].second);
+    }
+  }
+#endif
+
+  const char* dongle_id = getenv("DONGLE_ID");
+  if (dongle_id) {
+    init.setDongleId(std::string(dongle_id));
+  }
+  init.setDirty(!getenv("CLEAN"));
+
+  // log params
+  Params params = Params();
+  init.setGitCommit(params.get("GitCommit"));
+  init.setGitBranch(params.get("GitBranch"));
+  init.setGitRemote(params.get("GitRemote"));
+  init.setPassive(params.read_db_bool("Passive"));
+  {
+    std::map<std::string, std::string> params_map;
+    params.read_db_all(&params_map);
+    auto lparams = init.initParams().initEntries(params_map.size());
+    int i = 0;
+    for (auto& kv : params_map) {
+      auto lentry = lparams[i];
+      lentry.setKey(kv.first);
+      lentry.setValue(kv.second);
+      i++;
+    }
+  }
+  return capnp::messageToFlatArray(msg);
+}
+
+void log_init_data(LoggerState *s) {
+  auto bytes = s->init_data.asBytes();
+  logger_log(s, bytes.begin(), bytes.size(), s->has_qlog);
+}
+
+
+static void log_sentinel(LoggerState *s, cereal::Sentinel::SentinelType type) {
+  MessageBuilder msg;
+  auto sen = msg.initEvent().initSentinel();
+  sen.setType(type);
+  auto bytes = msg.toBytes();
+
+  logger_log(s, bytes.begin(), bytes.size(), true);
+}
+
+// ***** logging functions *****
+
+void logger_init(LoggerState *s, const char* log_name, bool has_qlog) {
   umask(0);
 
   pthread_mutex_init(&s->lock, NULL);
@@ -66,6 +170,8 @@ void logger_init(LoggerState *s, const char* log_name, const uint8_t* init_data,
   strftime(s->route_name, sizeof(s->route_name),
            "%Y-%m-%d--%H-%M-%S", &timeinfo);
   snprintf(s->log_name, sizeof(s->log_name), "%s", log_name);
+
+  s->init_data = logger_build_init_data();
 }
 
 static LoggerHandle* logger_open(LoggerState *s, const char* root_path) {
@@ -87,7 +193,7 @@ static LoggerHandle* logger_open(LoggerState *s, const char* root_path) {
   snprintf(h->qlog_path, sizeof(h->qlog_path), "%s/qlog.bz2", h->segment_path);
   snprintf(h->lock_path, sizeof(h->lock_path), "%s.lock", h->log_path);
 
-  err = mkpath(h->log_path);
+  err = logger_mkpath(h->log_path);
   if (err) return NULL;
 
   FILE* lock_file = fopen(h->lock_path, "wb");
@@ -111,20 +217,10 @@ static LoggerHandle* logger_open(LoggerState *s, const char* root_path) {
     if (bzerror != BZ_OK) goto fail;
   }
 
-  if (s->init_data) {
-    BZ2_bzWrite(&bzerror, h->bz_file, s->init_data, s->init_data_len);
-    if (bzerror != BZ_OK) goto fail;
-
-    if (s->has_qlog) {
-      // init data goes in the qlog too
-      BZ2_bzWrite(&bzerror, h->bz_qlog, s->init_data, s->init_data_len);
-      if (bzerror != BZ_OK) goto fail;
-    }
-  }
-
   pthread_mutex_init(&h->lock, NULL);
   h->refcnt++;
   return h;
+
 fail:
   LOGE("logger failed to open files");
   if (h->bz_file) {
@@ -175,6 +271,8 @@ int logger_next(LoggerState *s, const char* root_path,
 
   pthread_mutex_unlock(&s->lock);
 
+  // write beggining of log metadata
+  log_init_data(s);
   log_sentinel(s, is_start_of_route ? cereal::Sentinel::SentinelType::START_OF_ROUTE : cereal::Sentinel::SentinelType::START_OF_SEGMENT);
   return 0;
 }
@@ -203,7 +301,6 @@ void logger_close(LoggerState *s) {
   log_sentinel(s, cereal::Sentinel::SentinelType::END_OF_ROUTE);
 
   pthread_mutex_lock(&s->lock);
-  free(s->init_data);
   if (s->cur_handle) {
     lh_close(s->cur_handle);
   }

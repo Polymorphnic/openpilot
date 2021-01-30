@@ -856,14 +856,16 @@ struct Plan {
 
 struct PathPlan {
   laneWidth @0 :Float32;
-
-  dPoly @1 :List(Float32);
-  cPoly @2 :List(Float32);
-  cProb @3 :Float32;
-  lPoly @4 :List(Float32);
   lProb @5 :Float32;
-  rPoly @6 :List(Float32);
   rProb @7 :Float32;
+  dPathPoints @20 :List(Float32);
+  dProb @21 :Float32;
+
+  cProbDEPRECATED @3 :Float32;
+  dPolyDEPRECATED @1 :List(Float32);
+  cPolyDEPRECATED @2 :List(Float32);
+  lPolyDEPRECATED @4 :List(Float32);
+  rPolyDEPRECATED @6 :List(Float32);
 
   angleSteers @8 :Float32; # deg
   rateSteers @13 :Float32; # deg/s
@@ -1972,6 +1974,10 @@ struct DriverState {
   faceOrientationStd @11 :List(Float32);
   facePositionStd @12 :List(Float32);
   sgProb @13 :Float32;
+  poorVision @17 :Float32;
+  partialFace @18 :Float32;
+  distractedPose @19 :Float32;
+  distractedEyes @20 :Float32;
 }
 
 struct DMonitoringState {
@@ -1991,6 +1997,7 @@ struct DMonitoringState {
   isLowStd @13 :Bool;
   hiStdCount @14 :UInt32;
   isPreview @15 :Bool;
+  isActiveMode @16 :Bool;
 
   rhdCheckedDEPRECATED @5 :Bool;
 }
@@ -2059,6 +2066,17 @@ struct Sentinel {
     startOfRoute @3;
   }
   type @0 :SentinelType;
+}
+
+struct ManagerState {
+  processes @0 :List(ProcessState);
+
+  struct ProcessState {
+    name @0 :Text;
+    pid @1 :Int32;
+    running @2 :Bool;
+    exitCode @3 :Int32;
+  }
 }
 
 struct Event {
@@ -2143,5 +2161,6 @@ struct Event {
     modelV2 @75 :ModelDataV2;
     frontEncodeIdx @76 :EncodeIndex; # driver facing camera
     wideEncodeIdx @77 :EncodeIndex;
+    managerState @78 :ManagerState;
   }
 }
